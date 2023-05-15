@@ -1,0 +1,10 @@
+create database `inventory-service`;
+create table inventory
+(
+    id       bigint auto_increment
+        primary key,
+    quantity int          null,
+    sku_code varchar(255) null
+);
+
+create user inventory;

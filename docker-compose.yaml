@@ -1,0 +1,199 @@
+version: "3.8"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.2
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  broker:
+    image: confluentinc/cp-kafka:7.3.2
+    container_name: broker
+    ports:
+      # To learn about configuring Kafka for access across networks see
+      # https://www.confluent.io/blog/kafka-client-cannot-connect-to-broker-on-aws-on-docker-etc/
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://broker:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  alltracks-storm-server-database:
+    image: mariadb:10.7.8
+    container_name: alltracks-storm-server-database
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpwd
+    volumes:
+      - alltracks-storm-server-database-data:/var/lib/mysql
+      - ./sql_init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpwd" ]
+      timeout: 20s
+      retries: 10
+
+
+  ## Zipkin
+  zipkin:
+    image: openzipkin/zipkin
+    container_name: zipkin
+    ports:
+      - "9411:9411"
+
+  alltracks-storm-server-keycloak:
+    image: quay.io/keycloak/keycloak:21.0.2
+    container_name: alma-licence-server-keycloak
+    restart: always
+    expose:
+      - "8080"
+    command:
+      - start-dev --import-realm --optimized --log-console-color=true --log-level=INFO
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KEYCLOAK_DATABASE_VENDOR=mariadb
+      - DB=mariadb
+      - DB_URL_HOST=alltracks-storm-server-database
+      - DB_URL_PORT=3306
+      - DB_SCHEMA=keycloak
+      - DB_USERNAME=root
+      - DB_PASSWORD=rootpwd
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./realms/:/opt/keycloak/data/import/
+    depends_on:
+      - alltracks-storm-server-database
+
+  ## Mongo Docker Compose Config
+  alltracks-storm-server-database-product:
+    container_name: alltracks-storm-server-database-product
+    image: mongo:4.4.14-rc0-focal
+    restart: always
+    ports:
+      - "27017:27017"
+    expose:
+      - "27017"
+    volumes:
+      - ./database-product:/docker-entrypoint-initdb.d
+    depends_on:
+      - alltracks-storm-server-keycloak
+      - api-gateway
+
+    ## Eureka Server
+  discovery-server:
+      image: spockerman/discovery-service:latest
+      container_name: discovery-server
+      pull_policy: always
+      ports:
+        - "8761:8761"
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+      depends_on:
+        - zipkin
+
+  api-gateway:
+      image: spockerman/api-gateway:latest
+      container_name: api-gateway
+      ports:
+        - "8181:8080"
+      expose:
+        - "8181"
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+        - LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_SECURITY= TRACE
+      depends_on:
+        - zipkin
+        - discovery-server
+        - alltracks-storm-server-keycloak
+
+    ## Product-Service Docker Compose Config
+  product-service:
+      container_name: product-service
+      image: spockerman/product-service:latest
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+      depends_on:
+        - alltracks-storm-server-database
+        - discovery-server
+        - api-gateway
+
+    ## Order-Service Docker Compose Config
+  order-service:
+      container_name: order-service
+      image: spockerman/order-service:latest
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+        - SPRING_DATASOURCE_URL=jdbc:mysql://alltracks-storm-server-database:3306/order-service
+      depends_on:
+        - alltracks-storm-server-database
+        - broker
+        - zipkin
+        - discovery-server
+        - api-gateway
+
+    ## Inventory-Service Docker Compose Config
+  inventory-service:
+      container_name: inventory-service
+      image: spockerman/inventory-service:latest
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+        - SPRING_DATASOURCE_URL=jdbc:mysql://alltracks-storm-server-database:3306/inventory-service
+      depends_on:
+        - alltracks-storm-server-database
+        - discovery-server
+        - api-gateway
+
+    ## Notification-Service Docker Compose Config
+  notification-service:
+      container_name: notification-service
+      image: spockerman/notification-service:latest
+      environment:
+        - SPRING_PROFILES_ACTIVE=docker
+      depends_on:
+        - zipkin
+        - broker
+        - discovery-server
+        - api-gateway
+  ## Prometheus
+  prometheus:
+    image: prom/prometheus:v2.37.1
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - product-service
+      - inventory-service
+      - order-service
+      - notification-service
+
+  grafana:
+    image: grafana/grafana-oss:8.5.2
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    links:
+      - prometheus:prometheus
+    volumes:
+      - ./grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=password
+volumes:
+  alltracks-storm-server-database-data:
+
+
